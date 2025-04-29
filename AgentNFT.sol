@@ -14,6 +14,12 @@ import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 
+// Interface for the Registry to check delegations
+interface ITBAgentRegistry {
+    function isDelegationApproved(uint256 tokenId, address operator) external view returns (bool);
+    function isGlobalOperator(address operator) external view returns (bool);
+}
+
 // ERC6551 Account Interface
 interface IERC6551Account {
     receive() external payable;
@@ -28,7 +34,8 @@ contract ERC6551Account is IERC165, IERC1271, IERC721Receiver, IERC1155Receiver,
     receive() external payable {}
 
     function executeCall(address to, uint256 value, bytes calldata data) external payable returns (bytes memory result) {
-        require(_isValidSigner(msg.sender), "Not token owner");
+        // Check who's calling this function
+        address msgSender = msg.sender;
         
         ++state;
 
@@ -52,7 +59,11 @@ contract ERC6551Account is IERC165, IERC1271, IERC721Receiver, IERC1155Receiver,
         return abi.decode(footer, (uint256, address, uint256));
     }
 
-    function supportsInterface(bytes4 interfaceId) external view returns (bool) {
+    function isValidSigner(address signer) public view returns (bool) {
+        return _isValidSigner(signer);
+    }
+
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
         return interfaceId == type(IERC165).interfaceId ||
                interfaceId == type(IERC1271).interfaceId ||
                interfaceId == type(IERC721Receiver).interfaceId ||
@@ -86,16 +97,47 @@ contract ERC6551Account is IERC165, IERC1271, IERC721Receiver, IERC1155Receiver,
 
     function _isValidSigner(address signer) internal view returns (bool) {
         (uint256 chainId, address tokenContract, uint256 tokenId) = this.token();
-        
+
         if (chainId != block.chainid) return false;
+
+        // First, check if this is being called through a registry
+        try TBAgentNFT(tokenContract).registry() returns (address registryAddress) {
+            // If registry exists and the signer is the registry itself, allow it
+            if (registryAddress != address(0)) {
+                if (signer == registryAddress) return true;
+                
+                // Also check if call came from the registry's executeFromAgent function
+                // This is likely the key issue in your original code
+                try ITBAgentRegistry(registryAddress).isGlobalOperator(signer) returns (bool isGlobal) {
+                    if (isGlobal) return true;
+                } catch {}
+                
+                // Check for token-specific delegation
+                try ITBAgentRegistry(registryAddress).isDelegationApproved(tokenId, signer) returns (bool isDelegated) {
+                    if (isDelegated) return true;
+                } catch {}
+            }
+        } catch {}
+
+        // Direct owner check
+        try IERC721(tokenContract).ownerOf(tokenId) returns (address owner) {
+            if (signer == owner) return true;
+        } catch {}
         
-        address owner = IERC721(tokenContract).ownerOf(tokenId);
-        
-        return signer == owner;
+        // Check if signer is the contract owner
+        try Ownable(tokenContract).owner() returns (address tokenContractOwner) {
+            if (signer == tokenContractOwner) return true;
+        } catch {}
+
+        // Check if signer is the approved registry
+        try TBAgentNFT(tokenContract).approvedRegistry() returns (address approvedRegistry) {
+            if (signer == approvedRegistry) return true;
+        } catch {}
+
+        return false;
     }
 }
 
-// Now let's update the AgentNFT contract to include ERC6551 functionality
 contract TBAgentNFT is ERC721Enumerable, Ownable {
     using Counters for Counters.Counter;
     
@@ -153,7 +195,7 @@ contract TBAgentNFT is ERC721Enumerable, Ownable {
     event RevenueDistributed(uint256 indexed agentId, uint256 amount);
     event AgentUsed(uint256 indexed agentId, address indexed user);
     
-    constructor(address _neoxToken) ERC721("Neo Pantheon Agent", "NPAG") Ownable(msg.sender) {
+    constructor(address _neoxToken) ERC721("Neo Pantheon Agent", "NEOP") Ownable(msg.sender) {
         neoxToken = IERC20(_neoxToken);
         
         // Deploy the account implementation during construction
@@ -168,16 +210,7 @@ contract TBAgentNFT is ERC721Enumerable, Ownable {
         approvedRegistry = _registry;
     }
     
-    /**
-     * @dev Create a new agent NFT (called by registry)
-     * @param to Recipient address
-     * @param agentId Agent ID
-     * @param agentType Agent type (0=Builder, 1=Researcher, 2=Socialite)
-     * @param name Agent name
-     * @param symbol Agent symbol
-     * @param customURI Custom token URI
-     * @return tokenId NFT token ID
-     */
+    // Create The AI Agent 12 NFTs & Ownership NFT Token (agentType is 0 = Builder, 1 = Researcher, 2 = Socialite)
     function createAgent(
         address to,
         uint256 agentId,
@@ -215,16 +248,7 @@ contract TBAgentNFT is ERC721Enumerable, Ownable {
         return tokenId;
     }
     
-    /**
-     * @dev Create a special ownership token with ERC6551 privileges
-     * @param to Recipient address
-     * @param agentId Agent ID
-     * @param agentType Agent type (0=Builder, 1=Researcher, 2=Socialite)
-     * @param name Agent name
-     * @param symbol Agent symbol
-     * @param customURI Custom token URI
-     * @return tokenId NFT token ID
-     */
+    // Create Ownership Token NFT with ERC6551 Privileges (Wallet, Send, Receive, etc)
     function createOwnershipToken(
         address to,
         uint256 agentId,
@@ -268,12 +292,14 @@ contract TBAgentNFT is ERC721Enumerable, Ownable {
         
         return tokenId;
     }
+
+    // Overrides the _baseURI function to return a custom prefix
+    function _baseURI() internal pure override returns (string memory) {
+        return "https://api.neopantheon.io/agent/";
+    }
     
-    /**
-     * @dev Create an ERC6551 account for a token
-     * @param tokenId The token ID to create an account for
-     * @return account The address of the created account
-     */
+
+    // Create an ERC6551 account for a token
     function createAccount(uint256 tokenId) internal returns (address) {
         bytes memory encodedData = abi.encodePacked(
             hex"3d602d80600a3d3981f3363d3d373d3d3d363d73",
@@ -299,12 +325,7 @@ contract TBAgentNFT is ERC721Enumerable, Ownable {
         return account;
     }
     
-    /**
-     * @dev Get the token bound account address for a token
-     * @param tokenId The token ID
-     * @return The address of the token bound account
-     */
-    
+    // Get the Wallet Address for the Ownership Token NFT
     function getTokenBoundAccount(uint256 tokenId) public view returns (address) {
         // Will revert if token doesn't exist
         ownerOf(tokenId);
@@ -374,20 +395,12 @@ contract TBAgentNFT is ERC721Enumerable, Ownable {
         emit RevenueClaimed(tokenId, msg.sender, amount);
     }
     
-    /**
-     * @dev Get the ownership token ID for an agent
-     * @param agentId Agent ID
-     * @return tokenId Ownership NFT token ID
-     */
+    // Get the ID for the Ownership Token
     function getAgentOwnershipToken(uint256 agentId) external view returns (uint256) {
         return agentToOwnershipToken[agentId];
     }
     
-    /**
-     * @dev Check if a token is an ownership token
-     * @param tokenId Token ID
-     * @return isOwnership True if it's an ownership token
-     */
+    // Check to See if NFT Token ID is an Ownership Token NFT
     function isOwnershipToken(uint256 tokenId) external view returns (bool) {
         return agentInfo[tokenId].isOwnershipToken;
     }
@@ -397,6 +410,7 @@ contract TBAgentNFT is ERC721Enumerable, Ownable {
         return agentTokens[agentId];
     }
     
+    // Override tokenURI to include the agent's symbol
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
         // Call ownerOf to verify the token exists
         // This will automatically revert if the token doesn't exist
@@ -413,16 +427,21 @@ contract TBAgentNFT is ERC721Enumerable, Ownable {
         AgentInfo storage info = agentInfo[tokenId];
         
         return string(abi.encodePacked(
-            "https://api.neopantheon.io/agent/",
+            _baseURI(),
             uint256ToString(info.agentId),
             "/nft/",
             uint256ToString(tokenId)
         ));
     }
+
+    // Returns the Symbol for a Specific Token (overrides default NFT behavior)
+    function symbolOfToken(uint256 tokenId) public view returns (string memory) {
+        // This will revert automatically if the token doesn't exist
+        ownerOf(tokenId);
+        return agentInfo[tokenId].symbol;
+    }
     
-    /**
-     * @dev Utility function to convert uint to string
-     */
+    // Convert uint to string (Utility Function)
     function uint256ToString(uint256 value) internal pure returns (string memory) {
         if (value == 0) {
             return "0";
